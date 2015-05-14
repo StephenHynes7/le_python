@@ -41,12 +41,13 @@ def dbg(msg):
 
 
 class PlainTextSocketAppender(threading.Thread):
-    def __init__(self, verbose=True):
+    def __init__(self, callback, verbose=True):
         threading.Thread.__init__(self)
         self.daemon = True
         self.verbose = verbose
         self._conn = None
         self._queue = le_helpers.create_queue(QUEUE_SIZE)
+        self._interrupted_evt_handler = callback
 
     def empty(self):
         return self._queue.empty()
@@ -111,6 +112,7 @@ class PlainTextSocketAppender(threading.Thread):
         except KeyboardInterrupt:
             if self.verbose:
                 dbg("Logentries asynchronous socket client interrupted")
+            self._interrupted_evt_handler()  # Tell the logger that the worker thread has been interrupted.
 
         self.close_connection()
 
@@ -151,6 +153,7 @@ class LogentriesHandler(logging.Handler):
         self.token = token
         self.good_config = True
         self.verbose = verbose
+        self._logging_thread_running = threading.Event()
         # give the socket 10 seconds to flush,
         # otherwise drop logs
         self.timeout = 10
@@ -163,13 +166,17 @@ class LogentriesHandler(logging.Handler):
         self.setFormatter(format)
         self.setLevel(logging.DEBUG)
         if force_tls:
-            self._thread = TLSSocketAppender(verbose=verbose)
+            self._thread = TLSSocketAppender(self.worker_thread_interruption_handler, verbose=verbose)
         else:
-            self._thread = SocketAppender(verbose=verbose)
+            self._thread = SocketAppender(self.worker_thread_interruption_handler, verbose=verbose)
+        self._logging_thread_running.set()
+
+    def worker_thread_interruption_handler(self):
+        self._logging_thread_running.clear()
 
     @property
     def _started(self):
-        return self._thread.is_alive()
+        return self._logging_thread_running.is_set()
 
     def flush(self):
         # wait for all queued logs to be send
@@ -187,7 +194,14 @@ class LogentriesHandler(logging.Handler):
             if not self._started and self.good_config:
                 if self.verbose:
                     dbg("Starting Logentries Asynchronous Socket Appender")
-                self._thread.start()
+                try:
+                    self._thread.start()
+                except RuntimeError:
+                    # Just in case, because it seems that 'normal' threading model works
+                    # in weird way together with Celery/GUnicorn.
+                    # So, hide away '...threads can be started only once...' error.
+                    pass
+                self._logging_thread_running.set()
 
             msg = self.format(record).rstrip('\n')
             msg = self.token + msg
